@@ -368,6 +368,8 @@ class PlotImageBatch(Hook):
 
         self.time_axis = time_axis
 
+        self.logger = get_logger(self)
+
     def after_step(self, batch_index, results):
         step = retrieve('global_step', results)
 
@@ -379,8 +381,10 @@ class PlotImageBatch(Hook):
                 name = key.split('/')[-1]
 
             if self.time_axis is not None:
-                t_batches = np.split(image_batch, 1, axis=self.time_axis)
+                n = image_batch.shape[self.time_axis]
+                t_batches = np.split(image_batch, n, axis=self.time_axis)
                 for ts, sub_batch in enumerate(t_batches):
+                    sub_batch = sub_batch.squeeze(self.time_axis)
                     savename = name + '_{:0>7d}-{:0>4}-ts{:0>2}.png' \
                         .format(step, batch_index, ts)
                     savename = os.path.join(self.root, savename)
@@ -423,9 +427,8 @@ class PrepareV2VDataHook(Hook):
 
     def after_step(self, step, results):
         for result in ['generated', 'label', 'images']:
-            if result in results['step_ops']:
-                images = results['step_ops'][result].float()
-                self.logger.info('{}: {}'.format(result, images.size()))
+            if result in results['step_ops'][0]:
+                images = results['step_ops'][0][result].float()
                 # Transpose [0, 1, 2, 3, 4] to [0, 1, 3, 4, 2]
                 images = images.transpose(2, 4)  # [0, 1, 4, 3, 2]
                 images = images.transpose(2, 3)  # [0, 1, 3, 4, 2]
@@ -433,12 +436,10 @@ class PrepareV2VDataHook(Hook):
                 # if images.size()[3] == 3:
                 #     images = ((images / 255.) * 2.) - 1.  # [-1, 1]
 
-                if images.size()[3] == 25:
-                    images = images.mean(3, keepdim=True)
+                if images.size()[4] == 25:
+                    images = images.mean(4, keepdim=True)
 
-                self.logger.info('{}: {}'.format(result, images.size()))
-
-                results['step_ops'][result] = images
+                results['step_ops'][0][result] = images
 
 
 class V2VTrainer(PyHookedModelIterator):
@@ -489,7 +490,9 @@ class V2VTrainer(PyHookedModelIterator):
         #     s = '{}/'.format(s)
         #     scalar_names += [prefix + s + n for n in loss_names_T]
 
-        ImPlotHook = IntervalHook([PlotImageBatch(P.latest_eval, image_names)],
+        ImPlotHook = IntervalHook([PlotImageBatch(P.latest_eval,
+                                                  image_names,
+                                                  time_axis=1)],
                                   interval=10,
                                   max_interval=500,
                                   modify_each=10)
