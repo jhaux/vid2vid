@@ -89,7 +89,7 @@ def get_skipped_flows(flowNet, flow_ref_all, conf_ref_all, real_B, flow_ref,
 def get_model(is_train, other_opts=None):
     def Model(config):
         if other_opts is None:
-            opt = TrainOptions() if is_train else TestOptions()
+            opt = TrainOptions()  # if is_train else TestOptions()
         else:
             opt = other_opts
         opt.label_nc = 25
@@ -117,7 +117,7 @@ def get_model(is_train, other_opts=None):
 
             return ModelCls
         else:
-            return create_model(opt)
+            return create_model(opt)[0]
     return Model
 
 
@@ -125,7 +125,7 @@ TrainModel = get_model(True)
 TestModel = get_model(False)
 
 
-def train_op(model, data, save_fake, **kwargs):
+def train_op(model, label, image, inst, save_fake, **kwargs):
     '''Op that is repeated at every iteration.
 
     Args:
@@ -184,9 +184,9 @@ def train_op(model, data, save_fake, **kwargs):
     #     .view(-1, t_len, 1, height, width) \
     #     if len(data['inst'].size()) > 2 else None
 
-    input_A = Variable(data['A'])
-    input_B = Variable(data['B'])
-    inst_A = Variable(data['inst'])
+    input_A = Variable(label)
+    input_B = Variable(image)
+    inst_A = Variable(inst)
 
     # logger.debug('inA: {}'.format(input_A.size()))
     # logger.debug('inB: {}'.format(input_B.size()))
@@ -196,17 +196,17 @@ def train_op(model, data, save_fake, **kwargs):
     fake_B, fake_B_raw, flow, weight, real_A, real_Bp, fake_B_last \
         = rets = modelG(input_A, input_B, inst_A, fake_B_last)
 
-    sizes = []
-    for ar in list(rets):
-        if isinstance(ar, list):
-            s = '{}x{}'.format(len(ar), ar[0].size())
-        else:
-            s = '{}'.format(ar.size())
-        sizes += [s]
+    # sizes = []
+    # for ar in list(rets):
+    #     if isinstance(ar, list):
+    #         s = '{}x{}'.format(len(ar), ar[0].size())
+    #     else:
+    #         s = '{}'.format(ar.size())
+    #     sizes += [s]
 
-    msg = 'Generated: \nfake_B: {}\nfake_B_raw: {}\nflow: {}\nweight: {}' \
-          '\nreal_A: {}\nrealBp: {}\nfake_B_last: {}\n\n\n'
-    msg = msg.format(*sizes)
+    # msg = 'Generated: \nfake_B: {}\nfake_B_raw: {}\nflow: {}\nweight: {}' \
+    #       '\nreal_A: {}\nrealBp: {}\nfake_B_last: {}\n\n\n'
+    # msg = msg.format(*sizes)
 
     # logger.debug(msg)
 
@@ -317,17 +317,20 @@ def train_op(model, data, save_fake, **kwargs):
     return ret_dict
 
 
-def test_op(model, label, inst, image, feat, save_fake, **kwargs):
-    label = Variable(label)
-    image = Variable(image)
-    if inst is not None:
-        inst = Variable(inst)
-    if feat is not None:
-        feat = Variable(feat)
+def test_op(model, label, image, inst, change_seq, save_fake, **kwargs):
 
-    losses, generated = model(label, inst, image, feat, infer=True)
+    if change_seq:
+        model.fake_B_prev = None
 
-    return {'generated': generated, 'images': image, 'label': label}
+    generated = model(label, image, inst)
+
+    real_A = generated[1]
+    fake_B = generated[0]
+
+    return {'generated': fake_B,
+            'images': image,
+            'label': label,
+            'real_A': real_A}
 
 
 class ToNumpyHook(Hook):
@@ -399,31 +402,31 @@ class PlotImageBatch(Hook):
 class PrepareV2VDataHook(Hook):
     def __init__(self):
         self.logger = get_logger(self)
+        self.last_fid = -1
 
     def before_step(self, step, fetches, feeds, batch):
         # Data comes from a Sequence Dataset
         im_heat = {}
         for key in ['target', 'heatmaps']:
-            t_keys = feeds[key][0]
-            # self.logger.info('{}: {}'.format(key, t_keys))
-            vals = [feeds[k] for k in t_keys]
-            val = np.stack(vals, axis=1)
+            val = feeds[key]
+            # # self.logger.info('{}: {}'.format(key, t_keys))
+            # vals = [feeds[k] for k in t_keys]
+            # val = np.stack(vals, axis=1)
             val = np.transpose(val, [0, 1, 4, 2, 3])
             im_heat[key] = val
         images = im_heat['target']
         heatmaps = im_heat['heatmaps']
 
-        # images = np.stack(images)
-        # heatmaps = np.stack(heatmaps)
+        current_fid = feeds['fid'][0]
 
-        # The generative model expects a dict data with keys A, B, inst
-
-        feeds['data'] = {}
-        feeds['data']['A'] = torch.from_numpy(heatmaps).float()
-        feeds['data']['B'] = torch.from_numpy(images).float()
-        feeds['data']['inst'] = None
-        feeds['data']['feat'] = None
+        feeds['label'] = torch.from_numpy(heatmaps).float()
+        feeds['image'] = torch.from_numpy(images).float()
+        feeds['inst'] = None
+        feeds['feat'] = None
+        feeds['change_seq'] = self.last_fid > current_fid  # for test
         feeds['save_fake'] = False
+
+        self.last_fid = current_fid
 
     def after_step(self, step, results):
         for result in ['generated', 'label', 'images']:
@@ -482,7 +485,7 @@ class V2VTrainer(PyHookedModelIterator):
                         'D_T_fake',
                         'G_T_Warp']
 
-        opt = TrainOptions()
+        opt = TrainOptions()  # Only default options here!
 
         prefix = 'step_ops/0/losses/per_frame/'
         scalar_names = [prefix + n for n in loss_names]
@@ -497,27 +500,33 @@ class V2VTrainer(PyHookedModelIterator):
                                   max_interval=500,
                                   modify_each=10)
 
+        checks = []
+        models = [model.G, model.D, model.F]
+        names = ['gen', 'discr', 'flow']
+        for n, m in zip(names, models):
+            checks += [PyCheckpointHook(P.checkpoints,
+                                        model.G,
+                                        'v2v_{}'.format(n),
+                                        interval=config['ckpt_freq'])]
+
         self.hook_freq = 1
-        self.hooks += [PrepareV2VDataHook(),
-                       PyCheckpointHook(P.checkpoints,
-                                        model,
-                                        'vid2vid',
-                                        interval=None),
-                       ToNumpyHook(),
+        self.hooks += [PrepareV2VDataHook()]
+        self.hooks += checks
+        self.hooks += [ToNumpyHook(),
                        ImPlotHook,
                        PyLoggingHook(scalar_keys=scalar_names,
                                      log_keys=scalar_names,
                                      root_path=P.latest_eval,
-                                     interval=config['log_freq'])]
+                                     interval=config['log_freq']),
+                       IncreaseLearningRate(model, opt.niter)]
 
     def step_ops(self):
-        def increment_global_step(*args, **kwargs):
-            self._global_step += 1
-            return self._global_step
-        return [train_op, increment_global_step]
+        return [train_op]
 
     def initialize(self, checkpoint_path=None):
         if checkpoint_path is not None:
+            self.logger.info(checkpoint_path)
+            exit()
             self.model.load_state_dict(torch.load(checkpoint_path))
 
     def fit(self, *args, **kwargs):
@@ -562,17 +571,29 @@ class Vid2VidEvaluator(PyHookedModelIterator):
 
         MHook = MetricHook(Ms, P.latest_eval)
 
-        self.hooks += [WaitForCheckpointHook(P.checkpoints, ''),
-                       RestorePytorchModelHook(self.model,
-                                               P.checkpoints,
-                                               self._global_step),
-                       PrepareP2PDataHook(),
-                       ToNumpyHook(),
-                       MHook,
-                       PlotImageBatch(P.latest_eval, image_names)]
+        self.hooks = [WaitForCheckpointHook(P.checkpoints, ''),
+                      RestorePytorchModelHook(self.model,
+                                              P.checkpoints,
+                                              self._global_step),
+                      PrepareV2VDataHook(),
+                      ToNumpyHook(),
+                      MHook,
+                      PlotImageBatch(P.latest_eval, image_names)]
 
     def step_ops(self):
         return [test_op]
+
+
+class IncreaseLearningRate(Hook):
+    '''Invokes the increment of the learning rate.'''
+    def __init__(self, model, niter):
+        self.model = model
+        self.niter = niter
+
+    def after_epoch(self, epoch, *args, **kwargs):
+        if epoch > self.niter:
+            model.G.update_learning_rate(epoch)
+            model.D.update_learning_rate(epoch)
 
 
 class DummyHook(Hook):
