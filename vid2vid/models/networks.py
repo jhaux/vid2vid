@@ -91,6 +91,8 @@ class CompositeGenerator(nn.Module):
         self.use_fg_model = use_fg_model
         self.no_flow = no_flow
         activation = nn.ReLU(True)
+
+        self.outnc = output_nc
         
         if use_fg_model:
             ### individial image generation
@@ -183,7 +185,8 @@ class CompositeGenerator(nn.Module):
         if use_raw_only or self.no_flow:
             img_final = img_raw
         else:
-            img_warp = self.resample(img_prev[:,-3:,...].cuda(gpu_id), flow).cuda(gpu_id)        
+            nc = self.outnc
+            img_warp = self.resample(img_prev[:, -nc:, ...].cuda(gpu_id), flow).cuda(gpu_id)        
             weight_ = weight.expand_as(img_raw)
             img_final = img_raw * weight_ + img_warp * (1-weight_)
         
@@ -750,6 +753,8 @@ class VGGLoss(nn.Module):
     def forward(self, x, y):
         while x.size()[3] > 1024:
             x, y = self.downsample(x), self.downsample(y)
+        x = x[:, :3, ...]
+        y = y[:, :3, ...]
         x_vgg, y_vgg = self.vgg(x), self.vgg(y)
         loss = 0
         for i in range(len(x_vgg)):

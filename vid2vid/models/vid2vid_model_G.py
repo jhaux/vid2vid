@@ -8,7 +8,7 @@ import os
 import sys
 from collections import OrderedDict
 from torch.autograd import Variable
-import util.util as util
+# import util.util as util
 from .base_model import BaseModel
 from . import networks
 
@@ -35,15 +35,19 @@ class Vid2VidModelG(BaseModel):
         if opt.openpose_only:
             opt.no_flow = True     
 
-        self.netG0 = networks.define_G(netG_input_nc, opt.output_nc, prev_output_nc, opt.ngf, opt.netG, 
-                                       opt.n_downsample_G, opt.norm, 0, self.gpu_ids, opt)
+        self.netG0 = networks.define_G(netG_input_nc, opt.output_nc,
+                                       prev_output_nc, opt.ngf, opt.netG, 
+                                       opt.n_downsample_G, opt.norm, 0,
+                                       self.gpu_ids, opt)
         for s in range(1, self.n_scales):            
             ngf = opt.ngf // (2**s)
-            setattr(self, 'netG'+str(s), networks.define_G(netG_input_nc, opt.output_nc, prev_output_nc, ngf, opt.netG+'Local', 
-                                                           opt.n_downsample_G, opt.norm, s, self.gpu_ids, opt))
+            setattr(self, 'netG'+str(s),
+                    networks.define_G(netG_input_nc, opt.output_nc, prev_output_nc,
+                                      ngf, opt.netG+'Local', opt.n_downsample_G,
+                                      opt.norm, s, self.gpu_ids, opt))
 
         print('---------- Networks initialized -------------') 
-        print('-----------------------------------------------')
+        print('---------------------------------------------')
 
         # load networks
         if not self.isTrain or opt.continue_train or opt.load_pretrain:                    
@@ -54,7 +58,7 @@ class Vid2VidModelG(BaseModel):
         
         # define training variables
         if self.isTrain:            
-            self.n_gpus = self.opt.n_gpus_gen // self.opt.batchSize    # number of gpus for running generator            
+            self.n_gpus = max(1, self.opt.n_gpus_gen // self.opt.batchSize)    # number of gpus for running generator            
             self.n_frames_bp = 1                                       # number of frames to backpropagate the loss            
             self.n_frames_per_gpu = min(self.opt.max_frames_per_gpu, self.opt.n_frames_total // self.n_gpus) # number of frames in each GPU
             self.n_frames_load = self.n_gpus * self.n_frames_per_gpu   # number of frames in all GPUs            
@@ -116,9 +120,16 @@ class Vid2VidModelG(BaseModel):
         gpu_split_id = self.opt.n_gpus_gen + 1        
         real_A_all, real_B_all, _ = self.encode_input(input_A, input_B, inst_A)        
 
+        # print('real_A_all:')
+        # print([s.size() for s in real_A_all] if isinstance(real_A_all, list) else real_A_all.size())
+        # print('real_B_all:')
+        # print([s.size() for s in real_B_all] if isinstance(real_B_all, list) else real_B_all.size())
+
         is_first_frame = fake_B_prev is None
         if is_first_frame: # at the beginning of a sequence; needs to generate the first frame
             fake_B_prev = self.generate_first_frame(real_A_all, real_B_all)                    
+            # print('fake_B_prev:')
+            # print([s.size() for s in fake_B_prev] if isinstance(fake_B_prev, list) else fake_B_prev.size())
                         
         netG = []
         for s in range(self.n_scales): # broadcast netG to all GPUs used for generator
@@ -143,6 +154,9 @@ class Vid2VidModelG(BaseModel):
         ### generate inputs   
         real_A_pyr = self.build_pyr(real_A_all)        
         fake_Bs_raw, flows, weights = None, None, None            
+
+        # print('real_A_pyr:')
+        # print([s.size() for s in real_A_pyr])
         
         ### sequentially generate each frame
         for t in range(n_frames_load):
@@ -155,21 +169,34 @@ class Vid2VidModelG(BaseModel):
                 si = n_scales-1-s
                 ### prepare inputs                
                 # 1. input labels
+                # print('si', si)
+                # print('t: {}, tG: {}, t+tG: {}'.format(t, tG, t+tG))
                 real_As = real_A_pyr[si]
                 _, _, _, h, w = real_As.size()                  
-                real_As_reshaped = real_As[:, t:t+tG,...].view(self.bs, -1, h, w).cuda(gpu_id)              
+                real_As_reshaped = real_As[:, t:t+tG,...].view(self.bs, -1, h, w).cuda(gpu_id)
+
+                # print('real_As:')
+                # print(real_As.size())
+
+                # print('real_As_reshaped:')
+                # print([s.size() for s in real_As_reshaped])
 
                 # 2. previous fake_Bs                
                 fake_B_prevs = fake_B_pyr[si][:, t:t+tG-1,...].cuda(gpu_id)
                 if (t % self.n_frames_bp) == 0:
                     fake_B_prevs = fake_B_prevs.detach()
                 fake_B_prevs_reshaped = fake_B_prevs.view(self.bs, -1, h, w)
+
+                # print('fake_B_prevs_reshaped:')
+                # print([s.size() for s in fake_B_prevs_reshaped])
                 
                 # 3. mask for foreground and whether to use warped previous image
                 mask_F = self.compute_mask(real_As, t+tG-1) if self.opt.fg else None
                 use_raw_only = self.opt.no_first_img and is_first_frame 
 
                 ### network forward                                                
+                # print('s: {}, net_id: {}'.format(s, net_id))
+                # print('\n'*10)
                 fake_B, flow, weight, fake_B_raw, fake_B_feat, flow_feat, fake_B_fg_feat \
                     = netG[s][net_id].forward(real_As_reshaped, fake_B_prevs_reshaped, mask_F, 
                                               fake_B_feat, flow_feat, fake_B_fg_feat, use_raw_only)
@@ -230,13 +257,14 @@ class Vid2VidModelG(BaseModel):
         if self.opt.no_first_img:          # model also generates first frame            
             fake_B_prev = Variable(self.Tensor(self.bs, tG-1, self.opt.output_nc, self.height, self.width).zero_())
         elif self.opt.isTrain or self.opt.use_real_img: # assume first frame is given
-            fake_B_prev = real_B[:,:(tG-1),...]            
+            fake_B_prev = real_B[:, :(tG-1), ...]
         elif self.opt.use_single_G:        # use another model (trained on single images) to generate first frame
             fake_B_prev = None
             if self.opt.use_instance:
                 real_A = real_A[:,:,:self.opt.label_nc,:,:]
-            for i in range(tG-1):                
-                feat_map = self.get_face_features(real_B[:,i], pool_map[:,i]) if self.opt.dataset_mode == 'face' else None
+            for i in range(tG-1):
+                feat_map = self.get_face_features(real_B[:,i], pool_map[:,i]) \
+                    if self.opt.dataset_mode == 'face' else None
                 fake_B = self.netG_i.forward(real_A[:,i], feat_map).unsqueeze(1)                
                 fake_B_prev = self.concat([fake_B_prev, fake_B], dim=1)
         else:

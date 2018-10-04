@@ -1,4 +1,16 @@
-from .base_options import BaseOptions
+from .base_options import BaseOptions, _BaseOptions
+
+
+class _TestOptions(_BaseOptions):
+    ntest = float("inf")
+    results_dir = './results/'
+    aspect_ratio = 1.0
+    phase = 'test'
+    which_epoch = 'latest'
+    how_many = 300
+    use_real_img = False
+    start_frame = 0
+    isTrain = False
 
 
 class TestOptions(BaseOptions):

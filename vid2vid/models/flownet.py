@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import sys
+import os
 from .base_model import BaseModel
 
 class FlowNet(BaseModel):
@@ -15,8 +16,10 @@ class FlowNet(BaseModel):
         from .flownet2_pytorch.utils import tools as flownet2_tools
         from .flownet2_pytorch.networks.resample2d_package.resample2d import Resample2d
         
-        self.flowNet = flownet2_tools.module_to_dict(flownet2_models)['FlowNet2']().cuda(self.gpu_ids[0])        
-        checkpoint = torch.load('models/flownet2_pytorch/FlowNet2_checkpoint.pth.tar')
+        self.flowNet = flownet2_tools.module_to_dict(flownet2_models)['FlowNet2']().cuda(self.gpu_ids[0])
+        ckpt = os.path.join(os.path.dirname(__file__),
+                            'flownet2_pytorch/FlowNet2_checkpoint.pth.tar')
+        checkpoint = torch.load(ckpt)
         self.flowNet.load_state_dict(checkpoint['state_dict'])
         self.flowNet.eval() 
         self.resample = Resample2d()

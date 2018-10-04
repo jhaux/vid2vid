@@ -1,4 +1,42 @@
-from .base_options import BaseOptions
+from .base_options import BaseOptions, _BaseOptions
+
+
+class _TrainOptions(_BaseOptions):
+    display_freq = 100
+    print_freq = 100
+    save_latest_freq = 1000
+    save_epoch_freq = 1
+    continue_train = False
+    phase = 'train'
+    which_epoch = 'latest'
+    niter = 10
+    niter_decay = 10
+    beta1 = 0.5
+    lr = 0.0002
+    TTUR = False
+    gan_mode = 'ls'
+    pool_size = 1
+    no_html = False
+
+    num_D = 2
+    n_layers_D = 3
+    no_vgg = False
+    no_ganFeat = False
+    lambda_feat = 10.0
+
+    lambda_T = 10.0
+    lambda_F = 10.0
+    n_frames_D = 3
+    n_scales_temporal = 3
+    max_frames_per_gpu = 1
+    max_frames_backpropagate = 1
+    max_t_step = 1
+    n_frames_total = 30
+    niter_step = 5
+    niter_fix_global = 0
+
+    isTrain = True
+
 
 
 class TrainOptions(BaseOptions):

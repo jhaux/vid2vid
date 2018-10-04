@@ -6,7 +6,7 @@ import os
 import sys
 from collections import OrderedDict
 from torch.autograd import Variable
-import util.util as util
+import vid2vid.util.util as util
 from .base_model import BaseModel
 from . import networks
 from .flownet2_pytorch.networks.resample2d_package.resample2d import Resample2d

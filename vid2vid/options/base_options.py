@@ -1,7 +1,69 @@
 import argparse
 import os
-from util import util
+from vid2vid.util import util
 import torch
+
+
+class _BaseOptions(object):
+    dataroot = 'datasets/Cityscapes/'
+    batchSize = 1
+    loadSize = 512
+    fineSize = 512
+    input_nc = 3
+    label_nc = 0
+    output_nc = 3
+
+    netG = 'composite'
+    ngf = 128
+    ndf = 64
+    n_blocks = 9
+    n_downsample_G = 3
+
+    gpu_ids = [0]
+    n_gpus_gen = 1
+    name = 'experiment_name'
+    dataset_mode = 'temporal'
+    model = 'vid2vid'
+    nThreads = 2
+    checkpoints_dir = './checkpoints'
+    norm = 'batch'
+    serial_batches = False
+    display_winsize = 512,
+    display_id = 0
+    tf_log = False
+    max_dataset_size = float("inf")
+    resize_or_crop = 'scaleWidth'
+    no_flip = False
+    use_instance = False
+    label_feat = False
+    feat_num = 3
+    nef = 32
+    load_features = False
+    netE = 'simple'
+    n_downsample_E = 3
+
+    n_blocks_local = 3
+    n_local_enhancers = 1
+
+    n_frames_G = 3
+    n_scales_spatial = 1
+    no_first_img = False
+    use_single_G = False
+    fg = False
+    fg_labels = '26'
+    no_flow = False
+
+    no_canny_edge = False
+    no_dist_map = False
+
+    densepose_only = False
+    openpose_only = False
+    add_face_disc = False
+    remove_face_labels = False
+    random_drop_prob = 0.2
+    load_pretrain = ''
+    debug = False
+
 
 class BaseOptions():
     def __init__(self):
