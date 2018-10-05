@@ -1,10 +1,10 @@
 model: vid2vid.edflow_implementations.implementations.TestModel
-dataset: hbu_journal.data.prjoti.TestDataset
+dataset: edflow.data.dataset.getSeqDataset
 iterator: vid2vid.edflow_implementations.implementations.Vid2VidEvaluator
 
 seqdataset:
-        dataset: hbu_journal.data.prjoti.PretrainDataset
-        seq_length: 3
+        dataset: hbu_journal.data.prjoti.TestDataset
+        seq_length: &SEQ 3
         seq_step: 1
 
 batch_size: 1
@@ -12,7 +12,7 @@ spatial_size: 128
 box_factor: 1
 bottleneck_factor: 2
 
-n_ts: 3
+n_ts: *SEQ
 
 hook_freq: 250
 log_freq: 250

@@ -89,7 +89,7 @@ def get_skipped_flows(flowNet, flow_ref_all, conf_ref_all, real_B, flow_ref,
 def get_model(is_train, other_opts=None):
     def Model(config):
         if other_opts is None:
-            opt = TrainOptions()  # if is_train else TestOptions()
+            opt = TrainOptions() if is_train else TestOptions()
         else:
             opt = other_opts
         opt.label_nc = 25
@@ -117,7 +117,9 @@ def get_model(is_train, other_opts=None):
 
             return ModelCls
         else:
-            return create_model(opt)[0]
+            opt.no_first_img = False
+            opt.use_real_img = True
+            return create_model(opt)
     return Model
 
 
@@ -322,15 +324,17 @@ def test_op(model, label, image, inst, change_seq, save_fake, **kwargs):
     if change_seq:
         model.fake_B_prev = None
 
-    generated = model(label, image, inst)
+    generated = model.inference(label, image, inst)
 
     real_A = generated[1]
+    real_B = generated[2]
     fake_B = generated[0]
 
     return {'generated': fake_B,
             'images': image,
             'label': label,
-            'real_A': real_A}
+            'real_A': real_A,
+            'real_B': real_B}
 
 
 class ToNumpyHook(Hook):
@@ -400,9 +404,10 @@ class PlotImageBatch(Hook):
 
 
 class PrepareV2VDataHook(Hook):
-    def __init__(self):
+    def __init__(self, isTrain=True):
         self.logger = get_logger(self)
         self.last_fid = -1
+        self.isTrain = isTrain
 
     def before_step(self, step, fetches, feeds, batch):
         # Data comes from a Sequence Dataset
@@ -417,7 +422,7 @@ class PrepareV2VDataHook(Hook):
         images = im_heat['target']
         heatmaps = im_heat['heatmaps']
 
-        current_fid = feeds['fid'][0]
+        current_fid = feeds['fid'][0][0]
 
         feeds['label'] = torch.from_numpy(heatmaps).float()
         feeds['image'] = torch.from_numpy(images).float()
@@ -429,18 +434,37 @@ class PrepareV2VDataHook(Hook):
         self.last_fid = current_fid
 
     def after_step(self, step, results):
-        for result in ['generated', 'label', 'images']:
+        for result in ['generated', 'label', 'images', 'real_A', 'real_B']:
             if result in results['step_ops'][0]:
                 images = results['step_ops'][0][result].float()
-                # Transpose [0, 1, 2, 3, 4] to [0, 1, 3, 4, 2]
-                images = images.transpose(2, 4)  # [0, 1, 4, 3, 2]
-                images = images.transpose(2, 3)  # [0, 1, 3, 4, 2]
+                if len(images.size()) == 5:
+                    # Transpose [0, 1, 2, 3, 4] to [0, 1, 3, 4, 2]
+                    images = images.transpose(2, 4)  # [0, 1, 4, 3, 2]
+                    images = images.transpose(2, 3)  # [0, 1, 3, 4, 2]
 
-                # if images.size()[3] == 3:
-                #     images = ((images / 255.) * 2.) - 1.  # [-1, 1]
+                    if images.size()[4] == 25:
+                        images = images.mean(4, keepdim=True)
 
-                if images.size()[4] == 25:
-                    images = images.mean(4, keepdim=True)
+                    if not self.isTrain:
+                        images = images[:, -1, ...]
+                elif len(images.size()) == 4:
+                    # Transpose [0, 1, 2, 3] to [0, 2, 3, 1]
+                    images = images.transpose(1, 3)  # [0, 3, 2, 1]
+                    images = images.transpose(1, 2)  # [0, 2, 3, 1]
+
+                    if images.size()[3] == 25:
+                        images = images.mean(3, keepdim=True)
+
+                elif len(images.size()) == 3:
+                    # Transpose [0, 1, 2] to [1, 2, 0]
+                    images = images.transpose(0, 2)  # [2, 1, 0]
+                    images = images.transpose(0, 1)  # [1, 2, 0]
+
+                    if images.size()[2] == 25:
+                        images = images.mean(2, keepdim=True)
+
+                    if not self.isTrain:
+                        images = images.unsqueeze(0)
 
                 results['step_ops'][0][result] = images
 
@@ -465,9 +489,13 @@ class V2VTrainer(PyHookedModelIterator):
                          bar_position,
                          desc='Train')
 
-        image_names = ['step_ops/0/generated',
-                       'step_ops/0/images',
-                       'step_ops/0/label']
+        image_names = [
+                'step_ops/0/generated',
+                'step_ops/0/images',
+                'step_ops/0/label',
+                'step_ops/0/real_A',
+                'step_ops/0/real_B'
+                ]
 
         loss_names = ['G_VGG',
                       'G_GAN',
@@ -539,24 +567,28 @@ class Vid2VidEvaluator(PyHookedModelIterator):
         kwargs['hook_freq'] = 1
         super().__init__(*args, **kwargs)
 
-        image_names = ['step_ops/0/generated',
-                       'step_ops/0/images',
-                       'step_ops/0/label']
+        image_names = [
+                'step_ops/0/generated',
+                'step_ops/0/images',
+                'step_ops/0/label',
+                'step_ops/0/real_A',
+                'step_ops/0/real_B'
+                ]
 
         M_reid = MetricTuple({},
-                             {'image': image_names[1],
+                             {'image': image_names[-1],
                               'generated': image_names[0]},
                              reIdMetricFn(nogpu=True),
                              'reId-distance')
 
         M_ssim = MetricTuple({},
-                             {'batch1': image_names[1],
+                             {'batch1': image_names[-1],
                               'batch2': image_names[0]},
                              ssim_metric,
                              'ssim')
 
         M_l2 = MetricTuple({},
-                           {'batch1': image_names[1],
+                           {'batch1': image_names[-1],
                             'batch2': image_names[0]},
                            l2_metric,
                            'l2')
@@ -571,14 +603,22 @@ class Vid2VidEvaluator(PyHookedModelIterator):
 
         MHook = MetricHook(Ms, P.latest_eval)
 
-        self.hooks = [WaitForCheckpointHook(P.checkpoints, ''),
-                      RestorePytorchModelHook(self.model,
-                                              P.checkpoints,
-                                              self._global_step),
-                      PrepareV2VDataHook(),
+        def filter_fn(name):
+            return '_gen' in name
+
+        restore = RestorePytorchModelHook(self.model,
+                                          P.checkpoints,
+                                          filter_fn,
+                                          self.set_global_step)
+
+        self.hooks = [WaitForCheckpointHook(P.checkpoints,
+                                            filter_fn,
+                                            callback=restore),
+                      PrepareV2VDataHook(isTrain=False),
                       ToNumpyHook(),
                       MHook,
-                      PlotImageBatch(P.latest_eval, image_names)]
+                      PlotImageBatch(P.latest_eval,
+                                     image_names)]
 
     def step_ops(self):
         return [test_op]
@@ -589,9 +629,11 @@ class IncreaseLearningRate(Hook):
     def __init__(self, model, niter):
         self.model = model
         self.niter = niter
+        self.logger = get_logger(self)
 
     def after_epoch(self, epoch, *args, **kwargs):
         if epoch > self.niter:
+            self.logger.info('updating learning rate')
             model.G.update_learning_rate(epoch)
             model.D.update_learning_rate(epoch)
 
@@ -608,10 +650,12 @@ class ImageEvaluator(PyHookedModelIterator):
         kwargs['hook_freq'] = 1
         super().__init__(*args, **kwargs)
 
-        self.hooks += [WaitForCheckpointHook(P.checkpoints, ''),
-                       RestorePytorchModelHook(self.model,
-                                               P.checkpoints,
-                                               self._global_step),
+        restore_callback = RestorePytorchModelHook(self.model,
+                                                   P.checkpoints,
+                                                   self._global_step),
+
+        self.hooks += [WaitForCheckpointHook(P.checkpoints,
+                                             callback=restore_callback),
                        PrepareV2VDataHook(),
                        ToNumpyHook()]
         self.hooks += [DummyHook(), TransferHook(self.root, self.model, self.config.get("eval_video", True))]

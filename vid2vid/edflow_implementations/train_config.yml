@@ -16,7 +16,7 @@ n_ts: 3
 
 hook_freq: 250
 log_freq: 250
-ckpt_freq: 20
+ckpt_freq: null
 test_freq: 1000
 drop_prob: 0.0
 num_steps: 100000

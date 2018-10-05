@@ -49,10 +49,10 @@ class Vid2VidModelG(BaseModel):
         print('---------- Networks initialized -------------') 
         print('---------------------------------------------')
 
-        # load networks
-        if not self.isTrain or opt.continue_train or opt.load_pretrain:                    
-            for s in range(self.n_scales):
-                self.load_network(getattr(self, 'netG'+str(s)), 'G'+str(s), opt.which_epoch, opt.load_pretrain)
+        # load networks - not. We handle this externally
+        # if not self.isTrain or opt.continue_train or opt.load_pretrain:                    
+        #     for s in range(self.n_scales):
+        #         self.load_network(getattr(self, 'netG'+str(s)), 'G'+str(s), opt.which_epoch, opt.load_pretrain)
                 
         self.netG_i = self.load_single_G() if self.use_single_G else None
         
@@ -230,7 +230,7 @@ class Vid2VidModelG(BaseModel):
             self.fake_B_feat = self.flow_feat = self.fake_B_fg_feat = None            
             for s in range(self.n_scales):
                 fake_B = self.generate_frame_infer(real_A[self.n_scales-1-s], s)
-        return fake_B, real_A[0][0, -1]
+        return fake_B, real_A[0][0, -1], real_B
 
     def generate_frame_infer(self, real_A, s):
         tG = self.opt.n_frames_G
