@@ -9,7 +9,8 @@ from edflow.hooks.pytorch_hooks import PyCheckpointHook, PyLoggingHook
 from edflow.hooks.evaluation_hooks import WaitForCheckpointHook, \
                                           RestorePytorchModelHook, \
                                           MetricTuple, \
-                                          MetricHook
+                                          MetricHook, \
+                                          KeepBestCheckpoints
 from edflow.custom_logging import get_logger, init_project
 from edflow.project_manager import ProjectManager
 from edflow.iterators.batches import plot_batch
@@ -89,36 +90,39 @@ def get_skipped_flows(flowNet, flow_ref_all, conf_ref_all, real_B, flow_ref,
 def get_model(is_train, other_opts=None):
     def Model(config):
         if other_opts is None:
-            opt = TrainOptions() if is_train else TestOptions()
+            opts = TrainOptions() if is_train else TestOptions()
         else:
-            opt = other_opts
-        opt.label_nc = 25
-        opt.input_nc = 4
-        opt.output_nc = 4
-        # opt.no_vgg = True
-        # opt.no_ganFeat = True
-        # opt.num_D = 1
-        # opt.n_layers_D = 1
-        # opt.n_gpus_gen = 2
-        opt.batchSize = config['batch_size']
-        opt.n_frames_G = config['n_ts']
+            opts = other_opts
+        opts.label_nc = 25
+        opts.input_nc = 4
+        opts.output_nc = 4
+        # opts.no_vgg = True
+        # opts.no_ganFeat = True
+        # opts.num_D = 1
+        # opts.n_layers_D = 1
+        # opts.n_gpus_gen = 2
+        opts.batchSize = config['batch_size']
+        opts.n_frames_G = config['n_ts']
         cvd = os.environ.get('V2V_GPUID', '0')
-        opt.gpu_ids = [int(d) for d in cvd.split(',')]
-        opt.name = 'vid2vid'
-        opt.checkpoints_dir = P.checkpoints
+        opts.gpu_ids = [int(d) for d in cvd.split(',')]
+        opts.name = 'vid2vid'
+        opts.checkpoints_dir = P.checkpoints
+        opts.no_first_img = True
+        # opts.use_real_img = False
+
+        opts.n_frames_G = 2
 
         if is_train:
-            G_, D_, F_ = create_model(opt)
+            G_, D_, F_ = create_model(opts)
 
             class ModelCls(object):
                 G = G_
                 D = D_
                 F = F_
+                opt = opts
 
             return ModelCls
         else:
-            opt.no_first_img = False
-            opt.use_real_img = True
             return create_model(opt)
     return Model
 
@@ -137,27 +141,28 @@ def train_op(model, label, image, inst, save_fake, **kwargs):
         save_fake (bool): Makes the model return the generated image.
     '''
 
-    opt = TrainOptions()
+    opt = model.opt
 
     modelG, modelD, flowNet = model.G, model.D, model.F
 
     # number of gpus used for generator for each batch
-    n_gpus = opt.n_gpus_gen // opt.batchSize
+    n_gpus = max(1, opt.n_gpus_gen // opt.batchSize)
     tG, tD = opt.n_frames_G, opt.n_frames_D
     tDB = tD * opt.output_nc
     s_scales = opt.n_scales_spatial
     t_scales = opt.n_scales_temporal
     input_nc = 1 if opt.label_nc != 0 else opt.input_nc
     output_nc = opt.output_nc
+    label_nc = opt.label_nc
 
-    # # n_frames_total = n_frames_load * n_loadings + tG - 1
-    # _, n_frames_total, _, height, width = data['B'].size()
+    # n_frames_total = n_frames_load * n_loadings + tG - 1
+    _, n_frames_total, _, height, width = image.size()
     # n_frames_total = n_frames_total // opt.output_nc
-    # # number of total frames loaded into GPU at a time for each batch
-    # n_frames_load = opt.max_frames_per_gpu * n_gpus
-    # n_frames_load = min(n_frames_load, n_frames_total - tG + 1)
-    # # number of loaded frames plus previous frames
-    # t_len = n_frames_load + tG - 1
+    # number of total frames loaded into GPU at a time for each batch
+    n_frames_load = opt.max_frames_per_gpu * n_gpus
+    n_frames_load = min(n_frames_load, n_frames_total - tG + 1)
+    # number of loaded frames plus previous frames
+    t_len = n_frames_load + tG - 1
 
     # the last generated frame from previous training batch (which
     # becomes input to the next batch)
@@ -170,151 +175,206 @@ def train_op(model, label, image, inst, save_fake, **kwargs):
     # temporally subsampled flows
     flow_ref_skipped, conf_ref_skipped = [None]*t_scales, [None]*t_scales
 
-    # logger.info('n_frames_total: {}, t_len: {}, n_frames_load'
-    #             .format(n_frames_total, t_len, n_frames_load))
+    logger.debug('n_frames_total: {}, t_len: {}, n_frames_load {}'
+                 .format(n_frames_total, t_len, n_frames_load))
 
-    # We do not llop over the video, as this is handled by our dataset.
-    # As zero_grad() is always called, this should not make a difference.
-    # for i in range(0, n_frames_total-t_len+1, n_frames_load):
+    N = 0
+    ret_dict = {}
+    for i in range(0, n_frames_total-t_len+1, n_frames_load):
 
-    # 5D tensor: batchSize, # of frames, # of channels, height, width
-    # input_A = Variable(data['A'][:, i*input_nc:(i+t_len)*input_nc, ...]) \
-    #     .view(-1, t_len, input_nc, height, width)
-    # input_B = Variable(data['B'][:, i*output_nc:(i+t_len)*output_nc, ...])\
-    #     .view(-1, t_len, output_nc, height, width)
-    # inst_A = Variable(data['inst'][:, i:i+t_len, ...]) \
-    #     .view(-1, t_len, 1, height, width) \
-    #     if len(data['inst'].size()) > 2 else None
+        # 5D tensor: batchSize, # of frames, # of channels, height, width
+        input_A = Variable(label[:, i:(i+t_len), ...])
+        input_A = input_A.view(-1, t_len, label_nc, height, width)
+        input_B = Variable(image[:, i:(i+t_len), ...])
+        input_B = input_B.view(-1, t_len, output_nc, height, width)
+        if inst is not None and len(inst.size()) > 2:
+            inst_A = Variable(inst[:, i:i+t_len, ...])
+            inst_A = inst_A.view(-1, t_len, 1, height, width)
+        else:
+            inst_A = None
 
-    input_A = Variable(label)
-    input_B = Variable(image)
-    inst_A = Variable(inst)
+        logger.debug('inA: {}'.format(input_A.size()))
+        logger.debug('inB: {}'.format(input_B.size()))
+        logger.debug('instA: {}'.format(inst_A if inst_A is None
+                                        else inst_A.size()))
 
-    # logger.debug('inA: {}'.format(input_A.size()))
-    # logger.debug('inB: {}'.format(input_B.size()))
-    # logger.debug('instA: {}'.format(inst_A.size()))
+        # generator
+        rets = modelG(input_A, input_B, inst_A, fake_B_last)
+        (fake_B,
+         fake_B_raw,
+         flow,
+         weight,
+         real_A,
+         real_Bp,
+         fake_B_last) = rets
 
-    # generator
-    fake_B, fake_B_raw, flow, weight, real_A, real_Bp, fake_B_last \
-        = rets = modelG(input_A, input_B, inst_A, fake_B_last)
+        if i == 0:
+            # the first generated image in this sequence
+            fake_B_first = fake_B[0, 0]
 
-    # sizes = []
-    # for ar in list(rets):
-    #     if isinstance(ar, list):
-    #         s = '{}x{}'.format(len(ar), ar[0].size())
-    #     else:
-    #         s = '{}'.format(ar.size())
-    #     sizes += [s]
+        # sizes = []
+        # for ar in list(rets):
+        #     if isinstance(ar, list):
+        #         s = '{}x{}'.format(len(ar), ar[0].size())
+        #     else:
+        #         s = '{}'.format(ar.size())
+        #     sizes += [s]
 
-    # msg = 'Generated: \nfake_B: {}\nfake_B_raw: {}\nflow: {}\nweight: {}' \
-    #       '\nreal_A: {}\nrealBp: {}\nfake_B_last: {}\n\n\n'
-    # msg = msg.format(*sizes)
+        # msg = 'Generated: \nfake_B: {}\nfake_B_raw: {}\nflow: {}\nweight: {}' \
+        #       '\nreal_A: {}\nrealBp: {}\nfake_B_last: {}\n\n\n'
+        # msg = msg.format(*sizes)
 
-    # logger.debug(msg)
+        # logger.debug(msg)
 
-    # the first generated image in this sequence
-    fake_B_first = fake_B[0, 0]
-    # the collection of previous and current real frames
-    real_B_prev, real_B = real_Bp[:, :-1], real_Bp[:, 1:]
+        # the collection of previous and current real frames
+        real_B_prev, real_B = real_Bp[:, :-1], real_Bp[:, 1:]
 
-    # discriminator
-    # individual frame discriminator
-    # reference flows and confidences
-    flow_ref, conf_ref = flowNet(real_B[:, :, :3, :, :],
-                                 real_B_prev[:, :, :3, :, :])
-    fake_B_prev = real_B_prev[:, 0:1] \
-        if fake_B_last is None else fake_B_last[0][:, -1:]
+        # discriminator
+        # individual frame discriminator
+        # reference flows and confidences
+        flow_ref, conf_ref = flowNet(real_B[:, :, :3, :, :],
+                                     real_B_prev[:, :, :3, :, :])
+        fake_B_prev = real_B_prev[:, 0:1] \
+            if fake_B_last is None else fake_B_last[0][:, -1:]
 
-    if fake_B.size()[1] > 1:
-        fake_B_prev = torch.cat([fake_B_prev, fake_B[:, :-1].detach()],
-                                dim=1)
+        if fake_B.size()[1] > 1:
+            fake_B_prev = torch.cat([fake_B_prev, fake_B[:, :-1].detach()],
+                                    dim=1)
 
-    losses = modelD(0, reshape([real_B, fake_B, fake_B_raw, real_A,
-                                real_B_prev, fake_B_prev, flow, weight,
-                                flow_ref, conf_ref]))
-    losses = [torch.mean(x) if x is not None else 0 for x in losses]
-    loss_dict = dict(zip(modelD.loss_names, losses))
+        losses = modelD(0, reshape([real_B, fake_B, fake_B_raw, real_A,
+                                    real_B_prev, fake_B_prev, flow, weight,
+                                    flow_ref, conf_ref]))
+        losses = [torch.mean(x) if x is not None else 0 for x in losses]
+        loss_dict = dict(zip(modelD.loss_names, losses))
 
-    # temporal discriminator
-    loss_dict_T = []
-    # get skipped frames for each temporal scale
-    if t_scales > 0:
-        real_B_all, real_B_skipped \
-            = get_skipped_frames(real_B_all, real_B, t_scales, tD)
-        fake_B_all, fake_B_skipped \
-            = get_skipped_frames(fake_B_all, fake_B, t_scales, tD)
+        # temporal discriminator
+        loss_dict_T = []
+        # get skipped frames for each temporal scale
+        if t_scales > 0:
+            real_B_all, real_B_skipped \
+                = get_skipped_frames(real_B_all, real_B, t_scales, tD)
+            fake_B_all, fake_B_skipped \
+                = get_skipped_frames(fake_B_all, fake_B, t_scales, tD)
 
-        flow_ref_all, conf_ref_all, flow_ref_skipped, conf_ref_skipped \
-            = get_skipped_flows(flowNet, flow_ref_all, conf_ref_all,
-                                real_B_skipped, flow_ref, conf_ref,
-                                t_scales, tD)
+            flow_ref_all, conf_ref_all, flow_ref_skipped, conf_ref_skipped \
+                = get_skipped_flows(flowNet,
+                                    flow_ref_all,
+                                    conf_ref_all,
+                                    real_B_skipped,
+                                    flow_ref,
+                                    conf_ref,
+                                    t_scales, tD)
 
-    # run discriminator for each temporal scale
-    for s in range(t_scales):
-        if real_B_skipped[s] is not None \
-                and real_B_skipped[s].size()[1] == tD:
-            losses = modelD(s+1,
-                            [real_B_skipped[s],
-                             fake_B_skipped[s],
-                             flow_ref_skipped[s],
-                             conf_ref_skipped[s]])
-            losses = [torch.mean(x) if not isinstance(x, int) else x
-                      for x in losses]
-            loss_dict_T.append(dict(zip(modelD.loss_names_T,
-                                        losses)))
+        # run discriminator for each temporal scale
+        for s in range(t_scales):
+            if real_B_skipped[s] is not None \
+                    and real_B_skipped[s].size()[1] == tD:
+                losses = modelD(s+1,
+                                [real_B_skipped[s],
+                                 fake_B_skipped[s],
+                                 flow_ref_skipped[s],
+                                 conf_ref_skipped[s]])
+                losses = [torch.mean(x) if not isinstance(x, int) else x
+                          for x in losses]
+                loss_dict_T.append(dict(zip(modelD.loss_names_T,
+                                            losses)))
 
-    # collect losses
-    loss_D = (loss_dict['D_fake'] + loss_dict['D_real']) * 0.5
-    loss_G = loss_dict['G_GAN'] + loss_dict['G_GAN_Feat'] \
-        + loss_dict['G_VGG']
-    loss_G += loss_dict['G_Warp'] + loss_dict['F_Flow'] \
-        + loss_dict['F_Warp'] + loss_dict['W']
-    if opt.add_face_disc:
-        loss_G += loss_dict['G_f_GAN'] + loss_dict['G_f_GAN_Feat']
-        loss_D += (loss_dict['D_f_fake'] + loss_dict['D_f_real']) * 0.5
+        # collect losses
+        loss_D = (loss_dict['D_fake'] + loss_dict['D_real']) * 0.5
+        loss_G = loss_dict['G_GAN'] + loss_dict['G_GAN_Feat'] \
+            + loss_dict['G_VGG']
+        loss_G += loss_dict['G_Warp'] + loss_dict['F_Flow'] \
+            + loss_dict['F_Warp'] + loss_dict['W']
+        if opt.add_face_disc:
+            loss_G += loss_dict['G_f_GAN'] + loss_dict['G_f_GAN_Feat']
+            loss_D += (loss_dict['D_f_fake'] + loss_dict['D_f_real']) * 0.5
 
-    # collect temporal losses
-    loss_D_T = []
-    t_scales_act = min(t_scales, len(loss_dict_T))
-    for s in range(t_scales_act):
-        loss_G += loss_dict_T[s]['G_T_GAN'] \
-            + loss_dict_T[s]['G_T_GAN_Feat'] \
-            + loss_dict_T[s]['G_T_Warp']
-        loss_D_T.append((loss_dict_T[s]['D_T_fake']
-                         + loss_dict_T[s]['D_T_real']) * 0.5)
+        # collect temporal losses
+        loss_D_T = []
+        t_scales_act = min(t_scales, len(loss_dict_T))
+        for s in range(t_scales_act):
+            loss_G += loss_dict_T[s]['G_T_GAN'] \
+                + loss_dict_T[s]['G_T_GAN_Feat'] \
+                + loss_dict_T[s]['G_T_Warp']
+            loss_D_T.append((loss_dict_T[s]['D_T_fake']
+                             + loss_dict_T[s]['D_T_real']) * 0.5)
 
-    # Backward Pass
-    optimizer_G = modelG.optimizer_G
-    optimizer_D = modelD.optimizer_D
-    # update generator weights
-    optimizer_G.zero_grad()
-    loss_G.backward()
-    optimizer_G.step()
+        # Backward Pass
+        optimizer_G = modelG.optimizer_G
+        optimizer_D = modelD.optimizer_D
+        # update generator weights
+        optimizer_G.zero_grad()
+        loss_G.backward()
+        optimizer_G.step()
 
-    # update discriminator weights
-    # individual frame discriminator
-    optimizer_D.zero_grad()
-    loss_D.backward()
-    optimizer_D.step()
-    # temporal discriminator
-    for s in range(t_scales_act):
-        optimizer_D_T = getattr(modelD.module, 'optimizer_D_T'+str(s))
-        optimizer_D_T.zero_grad()
-        loss_D_T[s].backward()
-        optimizer_D_T.step()
+        # update discriminator weights
+        # individual frame discriminator
+        optimizer_D.zero_grad()
+        loss_D.backward()
+        optimizer_D.step()
+        # temporal discriminator
+        for s in range(t_scales_act):
+            optimizer_D_T = getattr(modelD, 'optimizer_D_T'+str(s))
+            optimizer_D_T.zero_grad()
+            loss_D_T[s].backward()
+            optimizer_D_T.step()
 
-    # logger.debug('loss_dict_T: {}\n\n\n\n\n'.format(loss_D_T))
+        # logger.debug('loss_dict_T: {}\n\n\n\n\n'.format(loss_D_T))
 
-    def det(t):
-        return t.detach()
+        def det(t):
+            return t.detach()
 
-    walk(loss_dict, det, inplace=True)
-    walk(loss_dict_T, det, inplace=True)
+        walk(loss_dict, det, inplace=True)
+        walk(loss_dict_T, det, inplace=True)
 
-    ret_dict = {'losses': {'per_frame': loss_dict, 'temporal': loss_dict_T},
-                'generated': fake_B.detach(),
-                'images': real_B.detach(),
-                'label': real_A.detach()}
+        gen = [fake_B.detach()] if i == 0 else [fake_B.detach()]
+        ret_dict_t = {'losses': {'per_frame': loss_dict,
+                                 'temporal': loss_dict_T},
+                      'generated': gen,
+                      'images': image,
+                      'label': label,
+                      'real_A': [real_A.detach()],
+                      'real_B': [real_B.detach()]}
+
+        if i == 0:
+            ret_dict = ret_dict_t
+        else:
+            def sums(key, t):
+                other = retrieve(key, ret_dict_t['losses'])
+                t += other
+                return t
+
+            ret_dict['losses'] = walk(ret_dict_t['losses'],
+                                      sums,
+                                      pass_key=True)
+
+            ret_dict['generated'] += ret_dict_t['generated']
+            ret_dict['real_A'] += ret_dict_t['real_A']
+            ret_dict['real_B'] += ret_dict_t['real_B']
+
+        N += 1
+
+    def div(t):
+        t /= N
+        return t
+
+    walk(ret_dict['losses'], div, inplace=True)
+
+    logger.debug('generated: {}'.format(len(ret_dict['generated'])))
+    logger.debug('real_A:    {}'.format(len(ret_dict['real_A'])))
+    logger.debug('real_B:    {}'.format(len(ret_dict['real_B'])))
+
+    ret_dict['generated'] = torch.cat(ret_dict['generated'], 1)
+    ret_dict['real_A'] = torch.cat(ret_dict['real_A'], 1)
+    ret_dict['real_B'] = torch.cat(ret_dict['real_B'], 1)
+
+    G = ret_dict['generated']
+    A = ret_dict['real_A']
+    B = ret_dict['real_B']
+
+    logger.debug('generated: {}, {}, {}'.format(G.size(), G.type(), [G.min(), G.max()]))
+    logger.debug('real_A:    {}, {}, {}'.format(A.size(), A.type(), [A.min(), A.max()]))
+    logger.debug('real_B:    {}, {}, {}'.format(B.size(), B.type(), [B.min(), B.max()]))
 
     return ret_dict
 
@@ -513,13 +573,15 @@ class V2VTrainer(PyHookedModelIterator):
                         'D_T_fake',
                         'G_T_Warp']
 
-        opt = TrainOptions()  # Only default options here!
+        opt = model.opt
 
         prefix = 'step_ops/0/losses/per_frame/'
         scalar_names = [prefix + n for n in loss_names]
-        # for s in range(opt.n_scales_temporal):
-        #     s = '{}/'.format(s)
-        #     scalar_names += [prefix + s + n for n in loss_names_T]
+
+        prefix_t = 'step_ops/0/losses/temporal/'
+        for s in range(opt.n_frames_G - 1):
+            s = '{}/'.format(s)
+            scalar_names += [prefix_t + s + n for n in loss_names_T]
 
         ImPlotHook = IntervalHook([PlotImageBatch(P.latest_eval,
                                                   image_names,
@@ -618,7 +680,11 @@ class Vid2VidEvaluator(PyHookedModelIterator):
                       ToNumpyHook(),
                       MHook,
                       PlotImageBatch(P.latest_eval,
-                                     image_names)]
+                                     image_names),
+                      KeepBestCheckpoints(P.checkpoints,
+                                          '{:0>6d}_metrics.npz',
+                                          'ssim',
+                                          n_keep=1)]
 
     def step_ops(self):
         return [test_op]

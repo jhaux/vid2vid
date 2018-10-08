@@ -12,6 +12,21 @@ from torch.autograd import Variable
 from .base_model import BaseModel
 from . import networks
 
+from edflow.util import walk
+from edflow.custom_logging import get_logger
+
+
+logger = get_logger(__name__)
+
+
+def sizes_(t):
+    return t.size()
+
+
+def sizes(t):
+    return walk(t, sizes_)
+
+
 class Vid2VidModelG(BaseModel):
     def name(self):
         return 'Vid2VidModelG'
@@ -89,76 +104,97 @@ class Vid2VidModelG(BaseModel):
 
     def encode_input(self, input_map, real_image, inst_map=None):        
         size = input_map.size()
-        self.bs, tG, self.height, self.width = size[0], size[1], size[3], size[4]
-        
-        input_map = input_map.data.cuda()                
-        if self.opt.label_nc != 0:                        
-            # create one-hot vector for label map             
-            oneHot_size = (self.bs, tG, self.opt.label_nc, self.height, self.width)
-            input_label = torch.cuda.FloatTensor(torch.Size(oneHot_size)).zero_()
-            input_label = input_label.scatter_(2, input_map.long(), 1.0)    
-            input_map = input_label        
-        input_map = Variable(input_map)
-                
+        self.bs, self.height, self.width = size[0], size[3], size[4]
+
+        input_map = input_map.data.cuda()
+        # Here the map is not converted as in the original implementation, as
+        # we are not interested in segmentation but heat maps.
+
         if self.opt.use_instance:
-            inst_map = inst_map.data.cuda()            
-            edge_map = Variable(self.get_edges(inst_map))            
+            inst_map = inst_map.data.cuda()
+            edge_map = Variable(self.get_edges(inst_map))
             input_map = torch.cat([input_map, edge_map], dim=2)
-        
+
         pool_map = None
         if self.opt.dataset_mode == 'face':
             pool_map = inst_map.data.cuda()
-        
+
         # real images for training
         if real_image is not None:
-            real_image = Variable(real_image.data.cuda())   
+            real_image = Variable(real_image.data.cuda())
 
         return input_map, real_image, pool_map
 
     def forward(self, input_A, input_B, inst_A, fake_B_prev):
-        tG = self.opt.n_frames_G           
-        gpu_split_id = self.opt.n_gpus_gen + 1        
-        real_A_all, real_B_all, _ = self.encode_input(input_A, input_B, inst_A)        
+        tG = self.opt.n_frames_G
+        gpu_split_id = self.opt.n_gpus_gen + 1
 
-        # print('real_A_all:')
-        # print([s.size() for s in real_A_all] if isinstance(real_A_all, list) else real_A_all.size())
-        # print('real_B_all:')
-        # print([s.size() for s in real_B_all] if isinstance(real_B_all, list) else real_B_all.size())
+        encodings = self.encode_input(input_A, input_B, inst_A)
+        real_A_all, real_B_all, _ = encodings
+
+        logger.debug('MG.f: real_A_all: {}'.format(sizes(real_A_all)))
+        logger.debug('MG.f: real_B_all: {}'.format(sizes(real_B_all)))
 
         is_first_frame = fake_B_prev is None
-        if is_first_frame: # at the beginning of a sequence; needs to generate the first frame
-            fake_B_prev = self.generate_first_frame(real_A_all, real_B_all)                    
-            # print('fake_B_prev:')
-            # print([s.size() for s in fake_B_prev] if isinstance(fake_B_prev, list) else fake_B_prev.size())
-                        
+        # at the beginning of a sequence; needs to generate the first frame
+        if is_first_frame:
+            fake_B_prev = self.generate_first_frame(real_A_all, real_B_all)
+            logger.debug('MG.f: fake_B_prev: {}'.format(sizes(fake_B_prev)))
+
         netG = []
-        for s in range(self.n_scales): # broadcast netG to all GPUs used for generator
-            netG_s = getattr(self, 'netG'+str(s))                        
-            netG_s = torch.nn.parallel.replicate(netG_s, self.opt.gpu_ids[:gpu_split_id]) if self.split_gpus else [netG_s]
+        for s in range(self.n_scales):
+            # broadcast netG to all GPUs used for generator
+            netG_s = getattr(self, 'netG'+str(s))
+
+            if self.split_gpus:
+                netG_s = torch.nn.parallel.replicate(
+                        netG_s,
+                        self.opt.gpu_ids[:gpu_split_id])
+            else:
+                netG_s = [netG_s]
+
             netG.append(netG_s)
 
-        start_gpu = self.gpu_ids[1] if self.split_gpus else real_A_all.get_device()        
-        fake_B, fake_B_raw, flow, weight = self.generate_frame_train(netG, real_A_all, fake_B_prev, start_gpu, is_first_frame)        
+        start_gpu = self.gpu_ids[1] if self.split_gpus \
+            else real_A_all.get_device()
+
+        ftrain = self.generate_frame_train(netG,
+                                           real_A_all,
+                                           fake_B_prev,
+                                           start_gpu,
+                                           is_first_frame)
+        fake_B, fake_B_raw, flow, weight = ftrain
         fake_B_prev = [B[:, -tG+1:].detach() for B in fake_B]
         fake_B = [B[:, tG-1:] for B in fake_B]
 
-        return fake_B[0], fake_B_raw, flow, weight, real_A_all[:,tG-1:], real_B_all[:,tG-2:], fake_B_prev
+        return fake_B[0], \
+            fake_B_raw, \
+            flow, \
+            weight, \
+            real_A_all[:, tG-1:], \
+            real_B_all[:, tG-2:], \
+            fake_B_prev
 
-    def generate_frame_train(self, netG, real_A_all, fake_B_pyr, start_gpu, is_first_frame):        
-        tG = self.opt.n_frames_G        
+    def generate_frame_train(self,
+                             netG,
+                             real_A_all,
+                             fake_B_pyr,
+                             start_gpu,
+                             is_first_frame):
+        tG = self.opt.n_frames_G
         n_frames_load = self.n_frames_load
         n_scales = self.n_scales
         finetune_all = self.finetune_all
-        dest_id = self.gpu_ids[0] if self.split_gpus else start_gpu        
+        dest_id = self.gpu_ids[0] if self.split_gpus else start_gpu
 
-        ### generate inputs   
-        real_A_pyr = self.build_pyr(real_A_all)        
-        fake_Bs_raw, flows, weights = None, None, None            
+        # generate inputs
+        real_A_pyr = self.build_pyr(real_A_all)
+        fake_Bs_raw, flows, weights = None, None, None
 
         # print('real_A_pyr:')
         # print([s.size() for s in real_A_pyr])
-        
-        ### sequentially generate each frame
+
+        # sequentially generate each frame
         for t in range(n_frames_load):
             gpu_id = (t // self.n_frames_per_gpu + start_gpu) if self.split_gpus else start_gpu # the GPU idx where we generate this frame
             net_id = gpu_id if self.split_gpus else 0                                           # the GPU idx where the net is located

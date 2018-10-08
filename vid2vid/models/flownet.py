@@ -31,8 +31,10 @@ class FlowNet(BaseModel):
             assert(len(size) == 4 or len(size) == 5)
             if len(size) == 5:
                 b, n, c, h, w = size
-                input_A = input_A.view(-1, c, h, w)
-                input_B = input_B.view(-1, c, h, w)
+                input_A = input_A.contiguous().view(-1, c, h, w)
+                input_A = input_A[:, :3]
+                input_B = input_B.contiguous().view(-1, c, h, w)
+                input_B = input_B[:, :3]
                 flow, conf = self.compute_flow_and_conf(input_A, input_B)
                 return flow.view(b, n, 2, h, w), conf.view(b, n, 1, h, w)
             else:
