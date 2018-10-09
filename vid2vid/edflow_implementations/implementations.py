@@ -123,7 +123,7 @@ def get_model(is_train, other_opts=None):
 
             return ModelCls
         else:
-            return create_model(opt)
+            return create_model(opts)
     return Model
 
 
