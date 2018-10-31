@@ -11,7 +11,7 @@ seqdataset:
         seq_length: 9
         seq_step: 1
 
-batch_size: 5
+batch_size: 2
 spatial_size: 256
 box_factor: 1
 bottleneck_factor: 2
@@ -20,7 +20,7 @@ n_ts: 3
 
 hook_freq: 250
 log_freq: 250
-ckpt_freq: 10000
+ckpt_freq: 500
 test_freq: 1000
 drop_prob: 0.0
 num_steps: 250000
