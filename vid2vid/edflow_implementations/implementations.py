@@ -595,7 +595,7 @@ class V2VTrainer(PyHookedModelIterator):
         names = ['gen', 'discr', 'flow']
         for n, m in zip(names, models):
             checks += [PyCheckpointHook(P.checkpoints,
-                                        model.G,
+                                        m,
                                         'v2v_{}'.format(n),
                                         interval=config['ckpt_freq'])]
 
@@ -616,8 +616,15 @@ class V2VTrainer(PyHookedModelIterator):
     def initialize(self, checkpoint_path=None):
         if checkpoint_path is not None:
             self.logger.info(checkpoint_path)
-            exit()
-            self.model.load_state_dict(torch.load(checkpoint_path))
+
+            if 'gen' in checkpoint_path or 'discr' in checkpoint_path or 'flow' in checkpoint_path:
+                base_path = '_'.join(checkpoint_path.split('_')[:-1])
+            else:
+                base_path = checkpoint_path
+
+            self.model.G.load_state_dict(torch.load(base_path + '_gen.ckpt'))
+            self.model.F.load_state_dict(torch.load(base_path + '_flow.ckpt'))
+            self.model.D.load_state_dict(torch.load(base_path + '_discr.ckpt'))
 
     def fit(self, *args, **kwargs):
         return self.iterate(*args, **kwargs)
