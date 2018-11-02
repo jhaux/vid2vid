@@ -1,13 +1,9 @@
 model: vid2vid.edflow_implementations.implementations.TrainModel
-# dataset: edflow.data.dataset.getDebugDataset
 dataset: edflow.data.dataset.getSeqDataset
 iterator: vid2vid.edflow_implementations.implementations.V2VTrainer
 
-debugdataset: 
-        dataset: edflow.data.dataset.getSeqDataset
-        debug_length: 50
 seqdataset:
-        dataset: hbu_journal.data.prjoti.PretrainDataset
+        dataset: hbu_journal.data.ntugems.Train
         seq_length: 9
         seq_step: 1
 

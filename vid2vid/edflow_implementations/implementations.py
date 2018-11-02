@@ -717,6 +717,52 @@ class DummyHook(Hook):
         results["step_ops"]["params"] = results["step_ops"]["generated"]
 
 
+class StoreImageSequence(Hook):
+    def __init__(self, root, keys, names=None):
+        '''Extracts all images in a sequence and stores them at root.'''
+
+        self.root = root
+        self.keys = keys
+        self.names = names
+
+        if self.names is not None:
+            assert len(self.names) == len(self.keys)
+
+    def before_step(self, step, fetches, feeds, batch):
+        self.indices = batch['index_']
+        self.boxes = batch['box']
+        self.paths = batch['file_id']
+
+    def after_step(self, batch_index, results):
+        step = retrieve('global_step', results)
+
+        eval_dir = os.path.join(self.root, '{:6>0}'.format(step))
+
+        os.makedirs(eval_dir, exist_ok=True)
+
+        for key in self.keys:
+            if self.names is not None:
+                name = self.names[i]
+            else:
+                name = key.split('/')[-1]
+
+            batched_sequences = retrieve(key, results)
+
+            iterator = zip(self.indices,
+                           self.boxes,
+                           self.paths,
+                           batched_sequences)
+
+            for idx, b, fid, sequence in iterator:
+                for frame, image in enumerate(sequence):
+                    savename = os.path.join(eval_dir,
+                                            '{:0>7}_{}-{:0>3}.png'.format(idx, name, frame))
+                    save_image(image, savename)
+                    np.save(savename.replace('.png', '-box.npy'), b[frame])
+                    with open(savename.replace('.png', '-org.txt'), 'w+') as f:
+                        f.write(fid[0])
+
+
 class ImageEvaluator(PyHookedModelIterator):
     def __init__(self, *args, **kwargs):
         kwargs['desc'] = 'Eval'
@@ -732,6 +778,28 @@ class ImageEvaluator(PyHookedModelIterator):
                        PrepareV2VDataHook(),
                        ToNumpyHook()]
         self.hooks += [DummyHook(), TransferHook(self.root, self.model, self.config.get("eval_video", True))]
+
+    def step_ops(self):
+        return [test_op]
+
+
+class SequenceEvaluator(PyHookedModelIterator):
+    def __init__(self, *args, **kwargs):
+        kwargs['desc'] = 'Eval'
+        kwargs['hook_freq'] = 1
+        super().__init__(*args, **kwargs)
+
+        restore_callback = RestorePytorchModelHook(self.model,
+                                                   P.checkpoints,
+                                                   self._global_step),
+
+        self.hooks += [WaitForCheckpointHook(P.checkpoints,
+                                             callback=restore_callback),
+                       PrepareV2VDataHook(),
+                       ToNumpyHook()]
+        self.hooks += [ImageSequenceHook(P.latest_eval,
+                                         ['step_ops/0/generated',
+                                          'step_ops/0/images'])]
 
     def step_ops(self):
         return [test_op]
