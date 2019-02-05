@@ -13,7 +13,7 @@ from edflow.hooks.evaluation_hooks import WaitForCheckpointHook, \
                                           KeepBestCheckpoints
 from edflow.custom_logging import get_logger, init_project
 from edflow.project_manager import ProjectManager
-from edflow.iterators.batches import plot_batch
+from edflow.iterators.batches import plot_batch, save_image
 from edflow.util import retrieve, walk
 from edflow.metrics.image_metrics import ssim_metric, l2_metric
 
@@ -384,6 +384,8 @@ def test_op(model, label, image, inst, change_seq, save_fake, **kwargs):
     if change_seq:
         model.fake_B_prev = None
 
+    logger.info('im {}'.format(image.shape))
+
     generated = model.inference(label, image, inst)
 
     real_A = generated[1]
@@ -395,6 +397,36 @@ def test_op(model, label, image, inst, change_seq, save_fake, **kwargs):
             'label': label,
             'real_A': real_A,
             'real_B': real_B}
+
+
+def flow_op(model, label, image, inst, change_seq, save_fake, **kwargs):
+    N_ts = image.size()[1]
+    logger.info('N_ts {}'.format(N_ts))
+    labels = [label[:, i:i+2] for i in range(N_ts-2)]
+    images = [image[:, i:i+2] for i in range(N_ts-2)]
+    insts = inst if inst is not None else [inst] * len(labels)
+    change_seqs = (len(labels) - 1) * [False] + [True]
+    save_fakes = [False] * len(labels)
+
+    logger.info('ims {}'.format(image.size()))
+    logger.info('ims {}'.format(len(images)))
+
+    gathered_dict = {}
+    iterator = zip(labels, images, insts, change_seqs, save_fakes)
+    for frame, [l, i, inst, c, s] in enumerate(iterator):
+
+        ret_dict = test_op(model, l, i, inst, c, s)
+
+        for k, v in ret_dict.items():
+            if k not in gathered_dict:
+                gathered_dict[k] = []
+            gathered_dict[k] += [v]
+            logger.info('{} - {}: {}'.format(frame, k, v.size() if hasattr(v, 'size') else v))
+
+    for k, v in gathered_dict.items():
+        gathered_dict[k] = torch.cat(v)
+
+    return gathered_dict
 
 
 class ToNumpyHook(Hook):
@@ -474,21 +506,27 @@ class PrepareV2VDataHook(Hook):
         im_heat = {}
         for key in ['target', 'heatmaps']:
             val = feeds[key]
-            # # self.logger.info('{}: {}'.format(key, t_keys))
-            # vals = [feeds[k] for k in t_keys]
-            # val = np.stack(vals, axis=1)
+            self.logger.info('{}: {}'.format(key, np.shape(val)))
+            if len(val.shape) == 4:
+                val = np.expand_dims(val, 0)
             val = np.transpose(val, [0, 1, 4, 2, 3])
             im_heat[key] = val
         images = im_heat['target']
         heatmaps = im_heat['heatmaps']
 
-        current_fid = feeds['fid'][0][0]
+        current_fid = feeds['fid'][0]
+        if len(feeds['fid']) == 2:
+            current_fid = current_fid[0]
+        self.logger.info('cfid {}'.format(current_fid))
 
         feeds['label'] = torch.from_numpy(heatmaps).float()
         feeds['image'] = torch.from_numpy(images).float()
         feeds['inst'] = None
         feeds['feat'] = None
-        feeds['change_seq'] = self.last_fid > current_fid  # for test
+        if len(current_fid) > 1:
+            feeds['change_seq'] = False
+        else:
+            feeds['change_seq'] = not ((self.last_fid + 1) == current_fid)
         feeds['save_fake'] = False
 
         self.last_fid = current_fid
@@ -747,20 +785,25 @@ class StoreImageSequence(Hook):
                 name = key.split('/')[-1]
 
             batched_sequences = retrieve(key, results)
+            if key.split('/')[-1] == 'images':
+                batched_sequences = batched_sequences[1:]
 
             iterator = zip(self.indices,
                            self.boxes,
                            self.paths,
                            batched_sequences)
 
-            for idx, b, fid, sequence in iterator:
-                for frame, image in enumerate(sequence):
-                    savename = os.path.join(eval_dir,
-                                            '{:0>7}_{}-{:0>3}.png'.format(idx, name, frame))
-                    save_image(image, savename)
-                    np.save(savename.replace('.png', '-box.npy'), b[frame])
-                    with open(savename.replace('.png', '-org.txt'), 'w+') as f:
-                        f.write(fid[0])
+            logger.info('seq {}'.format(np.shape(batched_sequences)))
+            for frame, [idx, b, fid, image] in enumerate(iterator):
+                logger.info('fid {}'.format(fid))
+                logger.info('b {}'.format(b))
+                logger.info('seq {}'.format(image.shape))
+                savename = os.path.join(eval_dir,
+                                        '{:0>7}_{}-{:0>3}.png'.format(idx, name, frame))
+                save_image(image, savename)
+                np.save(savename.replace('.png', '-box.npy'), b[frame])
+                with open(savename.replace('.png', '-org.txt'), 'w+') as f:
+                    f.write(fid[0])
 
 
 class ImageEvaluator(PyHookedModelIterator):
@@ -771,7 +814,7 @@ class ImageEvaluator(PyHookedModelIterator):
 
         restore_callback = RestorePytorchModelHook(self.model,
                                                    P.checkpoints,
-                                                   self._global_step),
+                                                   self._global_step)
 
         self.hooks += [WaitForCheckpointHook(P.checkpoints,
                                              callback=restore_callback),
@@ -791,18 +834,19 @@ class SequenceEvaluator(PyHookedModelIterator):
 
         restore_callback = RestorePytorchModelHook(self.model,
                                                    P.checkpoints,
-                                                   self._global_step),
+                                                   self._global_step)
 
         self.hooks += [WaitForCheckpointHook(P.checkpoints,
+                                             lambda c: '_gen' in c,
                                              callback=restore_callback),
                        PrepareV2VDataHook(),
                        ToNumpyHook()]
-        self.hooks += [ImageSequenceHook(P.latest_eval,
+        self.hooks += [StoreImageSequence(P.latest_eval,
                                          ['step_ops/0/generated',
                                           'step_ops/0/images'])]
 
     def step_ops(self):
-        return [test_op]
+        return [flow_op]
 
 
 if __name__ == '__main__':

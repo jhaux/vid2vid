@@ -1,14 +1,15 @@
 model: vid2vid.edflow_implementations.implementations.TestModel
 # dataset: edflow.data.dataset.getDebugDataset
-dataset: hbu_journal.data.ntugems.FlatFlowEvaluationSamples
-iterator: vid2vid.edflow_implementations.implementations.V2VTrainer
+dataset: hbu_journal.data.ntugems.FlowEvaluationSamples
+iterator: vid2vid.edflow_implementations.implementations.SequenceEvaluator
 
 batch_size: 1
 spatial_size: 256
 box_factor: 1
 bottleneck_factor: 2
 
-n_ts: 3
+n_ts: 1
+seq_length: 3
 
 hook_freq: 250
 log_freq: 250
@@ -16,3 +17,6 @@ ckpt_freq: null
 test_freq: 1000
 drop_prob: 0.0
 num_steps: 100000
+
+random_seed: 42
+flow_samples: 200
